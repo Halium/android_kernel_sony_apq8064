@@ -724,6 +724,26 @@ static const struct file_operations vfp_bounce_fops = {
 };
 #endif
 
+void vfp_kmode_exception(void)
+{
+	/*
+	 * If we reach this point, a floating point exception has been raised
+	 * while running in kernel mode. If the NEON/VFP unit was enabled at the
+	 * time, it means a VFP instruction has been issued that requires
+	 * software assistance to complete, something which is not currently
+	 * supported in kernel mode.
+	 * If the NEON/VFP unit was disabled, and the location pointed to below
+	 * is properly preceded by a call to kernel_neon_begin(), something has
+	 * caused the task to be scheduled out and back in again. In this case,
+	 * rebuilding and running with CONFIG_DEBUG_ATOMIC_SLEEP enabled should
+	 * be helpful in localizing the problem.
+	 */
+	if (fmrx(FPEXC) & FPEXC_EN)
+		pr_crit("BUG: unsupported FP instruction in kernel mode\n");
+	else
+		pr_crit("BUG: FP instruction issued in kernel mode with FP unit disabled\n");
+}
+
 /*
  * VFP support code initialisation.
  */
@@ -731,7 +751,6 @@ static int __init vfp_init(void)
 {
 	unsigned int vfpsid;
 	unsigned int cpu_arch = cpu_architecture();
-
 	if (cpu_arch >= CPU_ARCH_ARMv6)
 		on_each_cpu(vfp_enable, NULL, 1);
 
@@ -809,8 +828,7 @@ static int __init vfp_init(void)
 	return 0;
 }
 
-static int __init vfp_rootfs_init(void)
-{
+static int __init vfp_late_init(void) {
 #ifdef CONFIG_PROC_FS
 	static struct proc_dir_entry *procfs_entry;
 
@@ -823,4 +841,5 @@ static int __init vfp_rootfs_init(void)
 }
 
 core_initcall(vfp_init);
-rootfs_initcall(vfp_rootfs_init);
+late_initcall(vfp_late_init);
+

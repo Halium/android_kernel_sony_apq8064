@@ -24,7 +24,7 @@
 #include <linux/spinlock.h>
 #include <linux/slab.h>
 #include <linux/msm_audio.h>
-#include <linux/android_pmem.h>
+
 #include <linux/memory_alloc.h>
 #include <linux/debugfs.h>
 #include <linux/time.h>
@@ -327,6 +327,16 @@ static int q6asm_session_alloc(struct audio_client *ac)
 	}
 	mutex_unlock(&session_lock);
 	return -ENOMEM;
+}
+
+static bool q6asm_is_valid_audio_client(struct audio_client *ac)
+{
+	int n;
+	for (n = 1; n <= SESSION_MAX; n++) {
+		if (session[n] == ac)
+			return 1;
+	}
+	return 0;
 }
 
 static void q6asm_session_free(struct audio_client *ac)
@@ -738,6 +748,18 @@ int q6asm_audio_client_buf_alloc_contiguous(unsigned int dir,
 		goto fail;
 	}
 
+	/* check for integer overflow */
+	if ((bufcnt > 0) && ((INT_MAX / bufcnt) < bufsz)) {
+		pr_err("%s: integer overflow\n", __func__);
+		mutex_unlock(&ac->cmd_lock);
+		goto fail;
+	}
+	bytes_to_alloc = bufsz * bufcnt;
+
+	/* The size to allocate should be multiple of 4K bytes */
+	bytes_to_alloc = PAGE_ALIGN(bytes_to_alloc);
+
+
 	rc = ion_phys(buf[0].client, buf[0].handle,
 		  (ion_phys_addr_t *)&buf[0].phys, (size_t *)&len);
 	if (rc) {
@@ -899,6 +921,12 @@ static int32_t q6asm_callback(struct apr_client_data *data, void *priv)
 		pr_err("ac or priv NULL\n");
 		return -EINVAL;
 	}
+	if (!q6asm_is_valid_audio_client(ac)) {
+		pr_err("%s: audio client pointer is invalid, ac = %p\n",
+				__func__, ac);
+		return -EINVAL;
+	}
+
 	if (ac->session <= 0 || ac->session > 8) {
 		pr_err("%s:Session ID is invalid, session = %d\n", __func__,
 			ac->session);

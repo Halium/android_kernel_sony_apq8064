@@ -35,6 +35,7 @@
 #include <linux/eventfd.h>
 #include <linux/blkdev.h>
 #include <linux/compat.h>
+#include <linux/personality.h>
 
 #include <asm/kmap_types.h>
 #include <asm/uaccess.h>
@@ -110,6 +111,9 @@ static int aio_setup_ring(struct kioctx *ctx)
 	unsigned nr_events = ctx->max_reqs;
 	unsigned long size;
 	int nr_pages;
+
+	if (current->personality & READ_IMPLIES_EXEC)
+		return -EPERM;
 
 	/* Compensate for the ring buffer's head/tail overlap entry */
 	nr_events += 2;	/* 1 is required, 2 for good luck */
@@ -1683,6 +1687,10 @@ long do_io_submit(aio_context_t ctx_id, long nr,
 	struct blk_plug plug;
 	struct kiocb_batch batch;
 
+#ifndef CONFIG_AIO_SSD_ONLY
+	struct blk_plug plug;
+#endif
+
 	if (unlikely(nr < 0))
 		return -EINVAL;
 
@@ -1700,7 +1708,9 @@ long do_io_submit(aio_context_t ctx_id, long nr,
 
 	kiocb_batch_init(&batch, nr);
 
+#ifndef CONFIG_AIO_SSD_ONLY
 	blk_start_plug(&plug);
+#endif
 
 	/*
 	 * AKPM: should this return a partial result if some of the IOs were

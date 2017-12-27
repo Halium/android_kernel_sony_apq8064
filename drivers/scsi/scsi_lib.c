@@ -217,6 +217,7 @@ int scsi_execute(struct scsi_device *sdev, const unsigned char *cmd,
 	req = blk_get_request(sdev->request_queue, write, __GFP_WAIT);
 	if (!req)
 		return ret;
+	blk_rq_set_block_pc(req);
 
 	if (bufflen &&	blk_rq_map_kern(sdev->request_queue, req,
 					buffer, bufflen, __GFP_WAIT))
@@ -228,7 +229,6 @@ int scsi_execute(struct scsi_device *sdev, const unsigned char *cmd,
 	req->sense_len = 0;
 	req->retries = retries;
 	req->timeout = timeout;
-	req->cmd_type = REQ_TYPE_BLOCK_PC;
 	req->cmd_flags |= flags | REQ_QUIET | REQ_PREEMPT;
 
 	/*
@@ -2357,10 +2357,14 @@ EXPORT_SYMBOL(scsi_device_quiesce);
  *
  *	Must be called with user context, may sleep.
  */
-void
-scsi_device_resume(struct scsi_device *sdev)
+void scsi_device_resume(struct scsi_device *sdev)
 {
-	if(scsi_device_set_state(sdev, SDEV_RUNNING))
+	/* check if the device state was mutated prior to resume, and if
+	 * so assume the state is being managed elsewhere (for example
+	 * device deleted during suspend)
+	 */
+	if (sdev->sdev_state != SDEV_QUIESCE ||
+	    scsi_device_set_state(sdev, SDEV_RUNNING))
 		return;
 	scsi_run_queue(sdev->request_queue);
 }

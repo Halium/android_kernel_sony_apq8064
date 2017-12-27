@@ -21,6 +21,9 @@
 #include <linux/tick.h>
 #include <linux/stop_machine.h>
 
+extern ktime_t ntp_get_next_leap(void);
+extern int __do_adjtimex(struct timex *);
+
 /* Structure holding internal timekeeping values. */
 struct timekeeper {
 	/* Current clocksource used for timekeeping. */
@@ -30,6 +33,8 @@ struct timekeeper {
 	/* The shift value of the current clocksource. */
 	int	shift;
 
+	/* CLOCK_MONOTONIC time value of a pending leap-second*/
+	ktime_t	next_leap_ktime;
 	/* Number of clock cycles in one NTP interval. */
 	cycle_t cycle_interval;
 	/* Number of clock shifted nano seconds in one NTP interval. */
@@ -92,7 +97,8 @@ __cacheline_aligned_in_smp DEFINE_SEQLOCK(xtime_lock);
 /* flag for if timekeeping is suspended */
 int __read_mostly timekeeping_suspended;
 
-
+/* Flag for if there is a persistent clock on this platform */
+bool __read_mostly persistent_clock_exist = false;
 
 /**
  * timekeeper_setup_internals - Set up internals to use clocksource clock.
@@ -186,6 +192,17 @@ static void update_rt_offset(void)
 	timekeeper.offs_real = timespec_to_ktime(tmp);
 }
 
+/*
+ *   tk_update_leap_state - helper to update the next_leap_ktime
+ */
+static inline void tk_update_leap_state(struct timekeeper *tk)
+{
+	tk->next_leap_ktime = ntp_get_next_leap();
+	if (tk->next_leap_ktime.tv64 != KTIME_MAX)
+		/* Convert to monotonic time */
+		tk->next_leap_ktime = ktime_sub(tk->next_leap_ktime, tk->offs_real);
+}
+
 /* must hold write on timekeeper.lock */
 static void timekeeping_update(bool clearntp)
 {
@@ -193,6 +210,7 @@ static void timekeeping_update(bool clearntp)
 		timekeeper.ntp_error = 0;
 		ntp_clear();
 	}
+	tk_update_leap_state(&timekeeper);
 	update_rt_offset();
 	update_vsyscall(&timekeeper.xtime, &timekeeper.wall_to_monotonic,
 			 timekeeper.clock, timekeeper.mult);
@@ -311,7 +329,7 @@ void ktime_get_ts(struct timespec *ts)
 	} while (read_seqretry(&timekeeper.lock, seq));
 
 	set_normalized_timespec(ts, ts->tv_sec + tomono.tv_sec,
-				ts->tv_nsec + tomono.tv_nsec + nsecs);
+		(s64)ts->tv_nsec + tomono.tv_nsec + nsecs);
 }
 EXPORT_SYMBOL_GPL(ktime_get_ts);
 
@@ -608,12 +626,14 @@ void __init timekeeping_init(void)
 	struct timespec now, boot;
 
 	read_persistent_clock(&now);
+
 	if (!timespec_valid_strict(&now)) {
 		pr_warn("WARNING: Persistent clock returned invalid value!\n"
 			"         Check your CMOS/BIOS settings.\n");
 		now.tv_sec = 0;
 		now.tv_nsec = 0;
-	}
+	} else if (now.tv_sec || now.tv_nsec)
+		persistent_clock_exist = true;
 
 	read_boot_clock(&boot);
 	if (!timespec_valid_strict(&boot)) {
@@ -693,11 +713,12 @@ static void __timekeeping_inject_sleeptime(struct timespec *delta)
 void timekeeping_inject_sleeptime(struct timespec *delta)
 {
 	unsigned long flags;
-	struct timespec ts;
 
-	/* Make sure we don't set the clock twice */
-	read_persistent_clock(&ts);
-	if (!(ts.tv_sec == 0 && ts.tv_nsec == 0))
+	/*
+	 * Make sure we don't set the clock twice, as timekeeping_resume()
+	 * already did it
+	 */
+	if (has_persistent_clock())
 		return;
 
 	write_seqlock_irqsave(&timekeeper.lock, flags);
@@ -724,22 +745,67 @@ void timekeeping_inject_sleeptime(struct timespec *delta)
  */
 static void timekeeping_resume(void)
 {
+	struct timekeeper *tk = &timekeeper;
+	struct clocksource *clock = tk->clock;
 	unsigned long flags;
-	struct timespec ts;
+	struct timespec ts_new, ts_delta;
+	cycle_t cycle_now, cycle_delta;
+	bool suspendtime_found = false;
 
-	read_persistent_clock(&ts);
+	read_persistent_clock(&ts_new);
 
 	clocksource_resume();
 
 	write_seqlock_irqsave(&timekeeper.lock, flags);
 
-	if (timespec_compare(&ts, &timekeeping_suspend_time) > 0) {
-		ts = timespec_sub(ts, timekeeping_suspend_time);
-		__timekeeping_inject_sleeptime(&ts);
+	/*
+	 * After system resumes, we need to calculate the suspended time and
+	 * compensate it for the OS time. There are 3 sources that could be
+	 * used: Nonstop clocksource during suspend, persistent clock and rtc
+	 * device.
+	 *
+	 * One specific platform may have 1 or 2 or all of them, and the
+	 * preference will be:
+	 *	suspend-nonstop clocksource -> persistent clock -> rtc
+	 * The less preferred source will only be tried if there is no better
+	 * usable source. The rtc part is handled separately in rtc core code.
+	 */
+	cycle_now = clock->read(clock);
+	if ((clock->flags & CLOCK_SOURCE_SUSPEND_NONSTOP) &&
+		cycle_now > clock->cycle_last) {
+		u64 num, max = ULLONG_MAX;
+		u32 mult = clock->mult;
+		u32 shift = clock->shift;
+		s64 nsec = 0;
+
+		cycle_delta = (cycle_now - clock->cycle_last) & clock->mask;
+
+		/*
+		 * "cycle_delta * mutl" may cause 64 bits overflow, if the
+		 * suspended time is too long. In that case we need do the
+		 * 64 bits math carefully
+		 */
+		do_div(max, mult);
+		if (cycle_delta > max) {
+			num = div64_u64(cycle_delta, max);
+			nsec = (((u64) max * mult) >> shift) * num;
+			cycle_delta -= num * max;
+		}
+		nsec += ((u64) cycle_delta * mult) >> shift;
+
+		ts_delta = ns_to_timespec(nsec);
+		suspendtime_found = true;
+	} else if (timespec_compare(&ts_new, &timekeeping_suspend_time) > 0) {
+		ts_delta = timespec_sub(ts_new, timekeeping_suspend_time);
+		suspendtime_found = true;
 	}
-	/* re-base the last cycle value */
-	timekeeper.clock->cycle_last = timekeeper.clock->read(timekeeper.clock);
-	timekeeper.ntp_error = 0;
+
+	if (suspendtime_found)
+		__timekeeping_inject_sleeptime(&ts_delta);
+
+	/* Re-base the last cycle value */
+	clock->cycle_last = cycle_now;
+	tk->ntp_error = 0;
 	timekeeping_suspended = 0;
 	timekeeping_update(false);
 	write_sequnlock_irqrestore(&timekeeper.lock, flags);
@@ -1329,10 +1395,16 @@ ktime_t ktime_get_update_offsets(ktime_t *offs_real, ktime_t *offs_boot)
 
 		*offs_real = timekeeper.offs_real;
 		*offs_boot = timekeeper.offs_boot;
+
+		now = ktime_add_ns(ktime_set(secs, 0), nsecs);
+		now = ktime_sub(now, *offs_real);
+
+		/* Handle leapsecond insertion adjustments */
+		if (unlikely(now.tv64 >= timekeeper.next_leap_ktime.tv64))
+			*offs_real = ktime_sub(timekeeper.offs_real, ktime_set(1, 0));
+
 	} while (read_seqretry(&timekeeper.lock, seq));
 
-	now = ktime_add_ns(ktime_set(secs, 0), nsecs);
-	now = ktime_sub(now, *offs_real);
 	return now;
 }
 #endif
@@ -1354,6 +1426,16 @@ ktime_t ktime_get_monotonic_offset(void)
 }
 EXPORT_SYMBOL_GPL(ktime_get_monotonic_offset);
 
+/*
+ * do_adjtimex() - Accessor function to NTP __do_adjtimex function
+ */
+int do_adjtimex(struct timex *txc)
+{
+	int ret;
+	ret = __do_adjtimex(txc);
+	tk_update_leap_state(&timekeeper);
+	return ret;
+}
 
 /**
  * xtime_update() - advances the timekeeping infrastructure

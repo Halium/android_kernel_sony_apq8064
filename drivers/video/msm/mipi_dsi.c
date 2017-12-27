@@ -49,6 +49,8 @@ static int mipi_dsi_off(struct platform_device *pdev);
 static int mipi_dsi_on(struct platform_device *pdev);
 static int mipi_dsi_fps_level_change(struct platform_device *pdev,
 					u32 fps_level);
+static int mipi_dsi_low_power_config(struct platform_device *pdev,
+					int enable);
 
 static struct platform_device *pdev_list[MSM_FB_MAX_DEV_LIST];
 static int pdev_list_cnt;
@@ -73,6 +75,17 @@ static int mipi_dsi_fps_level_change(struct platform_device *pdev,
 	mipi_dsi_wait4video_done();
 	mipi_dsi_configure_fb_divider(fps_level);
 	return 0;
+}
+
+static int mipi_dsi_low_power_config(struct platform_device *pdev,
+					int enable)
+{
+	int ret = 0;
+
+	if (mipi_dsi_pdata && mipi_dsi_pdata->panel_lp_en)
+		ret = mipi_dsi_pdata->panel_lp_en(enable);
+
+	return ret;
 }
 
 static int mipi_dsi_off(struct platform_device *pdev)
@@ -158,6 +171,7 @@ static int mipi_dsi_on(struct platform_device *pdev)
 	u32 ystride, bpp, data;
 	u32 dummy_xres, dummy_yres;
 	int target_type = 0;
+	int old_nice;
 
 	pr_debug("%s+:\n", __func__);
 
@@ -166,6 +180,15 @@ static int mipi_dsi_on(struct platform_device *pdev)
 	var = &fbi->var;
 	pinfo = &mfd->panel_info;
 	esc_byte_ratio = pinfo->mipi.esc_byte_ratio;
+
+	/*
+	 * Now first priority is to turn on LCD quickly for better
+	 * user experience. We set current task to higher priority
+	 * and restore it after panel is on.
+	 */
+	old_nice = task_nice(current);
+	if (old_nice > -20)
+		set_user_nice(current, -20);
 
 	if (mipi_dsi_pdata && mipi_dsi_pdata->dsi_power_save)
 		mipi_dsi_pdata->dsi_power_save(1);
@@ -333,6 +356,10 @@ static int mipi_dsi_on(struct platform_device *pdev)
 	else
 		up(&mfd->dma->mutex);
 
+	/* Restore current priority */
+	if (old_nice > -20)
+		set_user_nice(current, old_nice);
+
 	pr_debug("%s-:\n", __func__);
 
 	return ret;
@@ -496,6 +523,7 @@ static int mipi_dsi_probe(struct platform_device *pdev)
 	pdata->on = mipi_dsi_on;
 	pdata->off = mipi_dsi_off;
 	pdata->fps_level_change = mipi_dsi_fps_level_change;
+	pdata->low_power_config = mipi_dsi_low_power_config;
 	pdata->late_init = mipi_dsi_late_init;
 	pdata->early_off = mipi_dsi_early_off;
 	pdata->next = pdev;

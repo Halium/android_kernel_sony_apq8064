@@ -31,7 +31,6 @@
 #include <linux/fb.h>
 #include <linux/msm_mdp.h>
 #include <linux/file.h>
-#include <linux/android_pmem.h>
 #include <linux/major.h>
 #include <asm/system.h>
 #include <asm/mach-types.h>
@@ -770,35 +769,41 @@ static void mdp4_scale_setup(struct mdp4_overlay_pipe *pipe)
 void mdp4_overlay_solidfill_init(struct mdp4_overlay_pipe *pipe)
 {
 	char *base;
+	u32 off;
 	uint32 src_size, src_xy, dst_size, dst_xy;
 	uint32 format;
-	uint32 off;
-	int i;
+
+	if (!pipe)
+		return;
+
+	off = pipe->pipe_num * MDP4_VIDEO_OFF;
+	if (pipe->pipe_type == OVERLAY_TYPE_RGB)
+		base = MDP_BASE + MDP4_RGB_BASE + off;
+	else if (pipe->pipe_type == OVERLAY_TYPE_VIDEO)
+		base = MDP_BASE + MDP4_VIDEO_BASE + off;
+	else
+		base = NULL;
+
+	if (!base)
+		return;
 
 	src_size = ((pipe->src_h << 16) | pipe->src_w);
 	src_xy = ((pipe->src_y << 16) | pipe->src_x);
 	dst_size = ((pipe->dst_h << 16) | pipe->dst_w);
 	dst_xy = ((pipe->dst_y << 16) | pipe->dst_x);
 
-	base = MDP_BASE + MDP4_VIDEO_BASE;
-	off = MDP4_VIDEO_OFF;	/* 0x10000 */
 	mdp_clk_ctrl(1);
-	for(i = 0; i < 4; i++) {	/* 4 pipes */
-		format = inpdw(base + 0x50);
-		format |= MDP4_FORMAT_SOLID_FILL;
-		outpdw(base + 0x0000, src_size);/* MDP_RGB_SRC_SIZE */
-		outpdw(base + 0x0004, src_xy);	/* MDP_RGB_SRC_XY */
-		outpdw(base + 0x0008, dst_size);/* MDP_RGB_DST_SIZE */
-		outpdw(base + 0x000c, dst_xy);	/* MDP_RGB_DST_XY */
-		outpdw(base + 0x0050, format);/* MDP_RGB_SRC_FORMAT */
-		outpdw(base + 0x1008, 0x0);/* Black */
-		base += off;
-	}
-	/*
-	 * keep it at primary
-	 * will be picked up at first commit
-	 */
-	ctrl->flush[MDP4_MIXER0] = 0x3c; /* all pipes */
+
+	format = inpdw(base + 0x50);
+	format |= MDP4_FORMAT_SOLID_FILL;
+	outpdw(base + 0x0000, src_size);/* MDP_RGB_SRC_SIZE */
+	outpdw(base + 0x0004, src_xy);	/* MDP_RGB_SRC_XY */
+	outpdw(base + 0x0008, dst_size);/* MDP_RGB_DST_SIZE */
+	outpdw(base + 0x000c, dst_xy);	/* MDP_RGB_DST_XY */
+	outpdw(base + 0x0050, format);/* MDP_RGB_SRC_FORMAT */
+	outpdw(base + 0x1008, 0x0);/* Black */
+
+	mdp4_overlay_reg_flush(pipe, 0);
 	mdp_clk_ctrl(0);
 }
 
@@ -3421,9 +3426,6 @@ static int get_img(struct msmfb_data *img, struct fb_info *info,
 {
 	struct file *file;
 	int put_needed, ret = 0, fb_num;
-#ifdef CONFIG_ANDROID_PMEM
-	unsigned long vstart;
-#endif
 	*p_need = 0;
 
 	if (img->flags & MDP_BLIT_SRC_GEM) {
@@ -3454,17 +3456,8 @@ static int get_img(struct msmfb_data *img, struct fb_info *info,
 		return ret;
 	}
 
-#ifdef CONFIG_MSM_MULTIMEDIA_USE_ION
 	return mdp4_overlay_iommu_map_buf(img->memory_id, pipe, plane,
 		start, len, srcp_ihdl);
-#endif
-#ifdef CONFIG_ANDROID_PMEM
-	if (!get_pmem_file(img->memory_id, start, &vstart,
-					    len, srcp_file))
-		return 0;
-	else
-		return -EINVAL;
-#endif
 }
 
 #ifdef CONFIG_FB_MSM_MIPI_DSI
@@ -3547,7 +3540,7 @@ int mdp4_overlay_set(struct fb_info *info, struct mdp_overlay *req)
 	}
 
 	if (info->node != 0 || mfd->cont_splash_done)	/* primary */
-		if (!mfd->panel_power_on)		/* suspended */
+		if (mdp_fb_is_power_off(mfd))		/* suspended */
 			return -EPERM;
 
 	if (req->src.format == MDP_FB_FORMAT)
@@ -3670,7 +3663,7 @@ int mdp4_overlay_unset(struct fb_info *info, int ndx)
 		/* mixer 0 */
 		ctrl->mixer0_played = 0;
 		if (ctrl->panel_mode & MDP4_PANEL_MDDI) {
-			if (mfd->panel_power_on)
+			if (!mdp_fb_is_power_off(mfd))
 				mdp4_mddi_blt_dmap_busy_wait(mfd);
 		}
 	}
@@ -3680,7 +3673,7 @@ int mdp4_overlay_unset(struct fb_info *info, int ndx)
 
 	if (pipe->mixer_num == MDP4_MIXER0) {
 		if (ctrl->panel_mode & MDP4_PANEL_MDDI) {
-			if (mfd->panel_power_on)
+			if (!mdp_fb_is_power_off(mfd))
 				mdp4_mddi_overlay_restore();
 		}
 	} else {	/* mixer1, DTV, ATV */
@@ -3727,7 +3720,7 @@ int mdp4_overlay_vsync_ctrl(struct fb_info *info, int enable)
 	if (mfd == NULL)
 		return -ENODEV;
 
-	if (!mfd->panel_power_on)
+	if (mdp_fb_is_power_off(mfd))
 		return -EINVAL;
 
 	if (enable)
@@ -3996,7 +3989,7 @@ int mdp4_overlay_commit(struct fb_info *info)
 	if (mfd == NULL)
 		return -ENODEV;
 
-	if (!mfd->panel_power_on) /* suspended */
+	if (mdp_fb_is_power_off(mfd)) /* suspended */
 		return -EINVAL;
 
 	mixer = mfd->panel_info.pdest;	/* DISPLAY_1 or DISPLAY_2 */

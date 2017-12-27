@@ -640,7 +640,9 @@ static void exit_mm(struct task_struct * tsk)
 {
 	struct mm_struct *mm = tsk->mm;
 	struct core_state *core_state;
+#ifndef CONFIG_UML
 	int mm_released;
+#endif
 
 	mm_release(tsk, mm);
 	if (!mm)
@@ -687,9 +689,11 @@ static void exit_mm(struct task_struct * tsk)
 	task_unlock(tsk);
 	mm_update_next_owner(mm);
 
+#ifndef CONFIG_UML
 	mm_released = mmput(mm);
 	if (mm_released)
 		set_tsk_thread_flag(tsk, TIF_MM_RELEASED);
+#endif
 }
 
 /*
@@ -889,6 +893,7 @@ static void check_stack_usage(void)
 	static DEFINE_SPINLOCK(low_water_lock);
 	static int lowest_to_date = THREAD_SIZE;
 	unsigned long free;
+	int islower = false;
 
 	free = stack_not_used(current);
 
@@ -897,12 +902,16 @@ static void check_stack_usage(void)
 
 	spin_lock(&low_water_lock);
 	if (free < lowest_to_date) {
+		lowest_to_date = free;
+		islower = true;
+	}
+	spin_unlock(&low_water_lock);
+
+	if (islower) {
 		printk(KERN_WARNING "%s used greatest stack depth: %lu bytes "
 				"left\n",
 				current->comm, free);
-		lowest_to_date = free;
 	}
-	spin_unlock(&low_water_lock);
 }
 #else
 static inline void check_stack_usage(void) {}
@@ -957,6 +966,11 @@ void do_exit(long code)
 	}
 
 	exit_signals(tsk);  /* sets PF_EXITING */
+
+	if (tsk->flags & PF_SU) {
+		su_exit();
+	}
+
 	/*
 	 * tsk->flags are checked in the futex code to protect against
 	 * an exiting task cleaning up the robust pi futexes.
@@ -1015,8 +1029,6 @@ void do_exit(long code)
 
 	if (group_dead)
 		disassociate_ctty(1);
-
-	module_put(task_thread_info(tsk)->exec_domain->module);
 
 	proc_exit_connector(tsk);
 

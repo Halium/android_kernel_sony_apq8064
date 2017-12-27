@@ -26,7 +26,7 @@
 #include <linux/workqueue.h>
 #include <linux/freezer.h>
 
-#define ALARM_DELTA 120
+#define ALARM_DELTA 300
 
 /**
  * struct alarm_base - Alarm timer bases
@@ -63,15 +63,8 @@ void power_on_alarm_init(void)
 	struct rtc_wkalrm rtc_alarm;
 	struct rtc_time rt;
 	unsigned long alarm_time;
-	struct rtc_device *rtc;
 
-	rtc = alarmtimer_get_rtcdev();
-
-	/* If we have no rtcdev, just return */
-	if (!rtc)
-		return;
-
-	rtc_read_alarm(rtc, &rtc_alarm);
+	rtc_read_alarm(rtcdev, &rtc_alarm);
 	rt = rtc_alarm.time;
 
 	rtc_tm_to_time(&rt, &alarm_time);
@@ -1030,6 +1023,7 @@ static int __init alarmtimer_init(void)
 		.nsleep		= alarm_timer_nsleep,
 	};
 
+	mutex_init(&power_on_alarm_lock);
 	alarmtimer_rtc_timer_init();
 
 	posix_timers_register_clock(CLOCK_REALTIME_ALARM, &alarm_clock);

@@ -21,6 +21,7 @@
 #include <linux/uaccess.h>
 #include <linux/time.h>
 #include <asm/mach-types.h>
+#include <linux/mutex.h>
 #include <sound/apr_audio.h>
 #include <mach/qdsp6v2/usf.h>
 #include "q6usm.h"
@@ -50,6 +51,11 @@
 #define X_IND 0
 #define Y_IND 1
 #define Z_IND 2
+
+/* Shared memory limits */
+/* max_buf_size = (port_size(65535*2) * port_num(8) * group_size(3) */
+#define USF_MAX_BUF_SIZE 3145680
+#define USF_MAX_BUF_NUM  32
 
 /* Place for opreation result, received from QDSP6 */
 #define APR_RESULT_IND 1
@@ -117,6 +123,8 @@ struct usf_type {
 	uint16_t conflicting_event_types;
 	/* Bitmap of types of events from devs, conflicting with USF */
 	uint16_t conflicting_event_filters;
+	/* Mutex for exclusive operations (all public APIs) */
+	struct mutex mutex;
 };
 
 struct usf_input_dev_type {
@@ -435,6 +443,15 @@ static int config_xx(struct usf_xx_type *usf_xx, struct us_xx_info_type *config)
 	    (config == NULL))
 		return -EINVAL;
 
+	if ((config->buf_size == 0) ||
+	    (config->buf_size > USF_MAX_BUF_SIZE) ||
+	    (config->buf_num == 0) ||
+	    (config->buf_num > USF_MAX_BUF_NUM)) {
+		pr_err("%s: wrong params: buf_size=%d; buf_num=%d\n",
+		       __func__, config->buf_size, config->buf_num);
+		return -EINVAL;
+	}
+
 	data_map_size = sizeof(usf_xx->encdec_cfg.cfg_common.data_map);
 
 	if (config->client_name != NULL) {
@@ -747,6 +764,7 @@ static int usf_set_us_detection(struct usf_type *usf, unsigned long arg)
 {
 	uint32_t timeout = 0;
 	struct us_detect_info_type detect_info;
+	struct usm_session_cmd_detect_info *p_allocated_memory = NULL;
 	struct usm_session_cmd_detect_info usm_detect_info;
 	struct usm_session_cmd_detect_info *p_usm_detect_info =
 						&usm_detect_info;
@@ -773,12 +791,13 @@ static int usf_set_us_detection(struct usf_type *usf, unsigned long arg)
 		uint8_t *p_data = NULL;
 
 		detect_info_size += detect_info.params_data_size;
-		p_usm_detect_info = kzalloc(detect_info_size, GFP_KERNEL);
-		if (p_usm_detect_info == NULL) {
+		p_allocated_memory = kzalloc(detect_info_size, GFP_KERNEL);
+		if (p_allocated_memory == NULL) {
 			pr_err("%s: detect_info[%d] allocation failed\n",
 			       __func__, detect_info_size);
 			return -ENOMEM;
 		}
+		p_usm_detect_info = p_allocated_memory;
 		p_data = (uint8_t *)p_usm_detect_info +
 			sizeof(struct usm_session_cmd_detect_info);
 
@@ -788,7 +807,7 @@ static int usf_set_us_detection(struct usf_type *usf, unsigned long arg)
 		if (rc) {
 			pr_err("%s: copy params from user; rc=%d\n",
 				__func__, rc);
-			kfree(p_usm_detect_info);
+			kfree(p_allocated_memory);
 			return -EFAULT;
 		}
 		p_usm_detect_info->algorithm_cfg_size =
@@ -805,9 +824,7 @@ static int usf_set_us_detection(struct usf_type *usf, unsigned long arg)
 				    p_usm_detect_info,
 				    detect_info_size);
 	if (rc || (detect_info.detect_timeout == USF_NO_WAIT_TIMEOUT)) {
-		if (detect_info_size >
-		    sizeof(struct usm_session_cmd_detect_info))
-			kfree(p_usm_detect_info);
+		kfree(p_allocated_memory);
 		return rc;
 	}
 
@@ -830,22 +847,21 @@ static int usf_set_us_detection(struct usf_type *usf, unsigned long arg)
 	if (rc < 0) {
 		pr_err("%s: Getting US detection failed rc[%d]\n",
 		       __func__, rc);
-		return rc;
+	} else {
+		usf->usf_rx.us_detect_type = usf->usf_tx.us_detect_type;
+		detect_info.is_us =
+			(usf_xx->us_detect_type == USF_US_DETECT_YES);
+		rc = copy_to_user((void __user *)arg,
+				  &detect_info,
+				  sizeof(detect_info));
+		if (rc) {
+			pr_err("%s: copy detect_info to user; rc=%d\n",
+				__func__, rc);
+			rc = -EFAULT;
+		}
 	}
 
-	usf->usf_rx.us_detect_type = usf->usf_tx.us_detect_type;
-	detect_info.is_us = (usf_xx->us_detect_type == USF_US_DETECT_YES);
-	rc = copy_to_user((void __user *)arg,
-			  &detect_info,
-			  sizeof(detect_info));
-	if (rc) {
-		pr_err("%s: copy detect_info to user; rc=%d\n",
-			__func__, rc);
-		rc = -EFAULT;
-	}
-
-	if (detect_info_size > sizeof(struct usm_session_cmd_detect_info))
-		kfree(p_usm_detect_info);
+	kfree(p_allocated_memory);
 
 	return rc;
 } /* usf_set_us_detection */
@@ -942,14 +958,14 @@ static int usf_set_rx_info(struct usf_type *usf, unsigned long arg)
 	if (rc)
 		return rc;
 
-	if (usf_xx->buffer_size && usf_xx->buffer_count) {
-		rc = q6usm_us_client_buf_alloc(
-					IN,
-					usf_xx->usc,
-					usf_xx->buffer_size,
-					usf_xx->buffer_count);
-		if (rc)
-			return rc;
+	rc = q6usm_us_client_buf_alloc(
+				IN,
+				usf_xx->usc,
+				usf_xx->buffer_size,
+				usf_xx->buffer_count);
+	if (rc) {
+		q6usm_cmd(usf_xx->usc, CMD_CLOSE);
+		return rc;
 	}
 
 	rc = q6usm_dec_cfg_blk(usf_xx->usc,
@@ -1167,10 +1183,15 @@ static int usf_get_version(unsigned long arg)
 		return -EFAULT;
 	}
 
-	/* version_info.buf is pointer to place for the version string */
+	if (version_info.buf_size < sizeof(DRV_VERSION)) {
+		pr_err("%s: buf_size (%d) < version string size (%d)\n",
+			__func__, version_info.buf_size, sizeof(DRV_VERSION));
+		return -EINVAL;
+	}
+
 	rc = copy_to_user(version_info.pbuf,
 			  DRV_VERSION,
-			  version_info.buf_size);
++			  sizeof(DRV_VERSION));
 	if (rc) {
 		pr_err("%s: copy to version_info.pbuf; rc=%d\n",
 			__func__, rc);
@@ -1189,10 +1210,11 @@ static int usf_get_version(unsigned long arg)
 	return rc;
 } /* usf_get_version */
 
-static long usf_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
+static long __usf_ioctl(struct usf_type *usf,
+		unsigned int cmd,
+		unsigned long arg)
 {
 	int rc = 0;
-	struct usf_type *usf = file->private_data;
 	struct usf_xx_type *usf_xx = NULL;
 
 	switch (cmd) {
@@ -1333,6 +1355,16 @@ static long usf_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 		release_xx(usf_xx);
 
 	return rc;
+} /* __usf_ioctl */
+
+static long usf_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
+{
+	struct usf_type *usf = file->private_data;
+	int rc = 0;
+	mutex_lock(&usf->mutex);
+	rc = __usf_ioctl(usf, cmd, arg);
+	mutex_unlock(&usf->mutex);
+	return rc;
 } /* usf_ioctl */
 
 static int usf_mmap(struct file *file, struct vm_area_struct *vms)
@@ -1340,13 +1372,18 @@ static int usf_mmap(struct file *file, struct vm_area_struct *vms)
 	struct usf_type *usf = file->private_data;
 	int dir = OUT;
 	struct usf_xx_type *usf_xx = &usf->usf_tx;
+	int rc = 0;
 
+	mutex_lock(&usf->mutex);
 	if (vms->vm_flags & USF_VM_WRITE) { /* RX buf mapping */
 		dir = IN;
 		usf_xx = &usf->usf_rx;
 	}
 
-	return q6usm_get_virtual_address(dir, usf_xx->usc, vms);
+	rc = q6usm_get_virtual_address(dir, usf_xx->usc, vms);
+	mutex_unlock(&usf->mutex);
+
+	return rc;
 }
 
 static uint16_t add_opened_dev(int minor)
@@ -1397,7 +1434,7 @@ static int usf_open(struct inode *inode, struct file *file)
 
 	usf->usf_tx.us_detect_type = USF_US_DETECT_UNDEF;
 	usf->usf_rx.us_detect_type = USF_US_DETECT_UNDEF;
-
+	mutex_init(&usf->mutex);
 	pr_debug("%s:usf in open\n", __func__);
 	return 0;
 }
@@ -1408,6 +1445,7 @@ static int usf_release(struct inode *inode, struct file *file)
 
 	pr_debug("%s: release entry\n", __func__);
 
+	mutex_lock(&usf->mutex);
 	usf_release_input(usf);
 
 	usf_disable(&usf->usf_tx);
@@ -1415,6 +1453,8 @@ static int usf_release(struct inode *inode, struct file *file)
 
 	s_opened_devs[usf->dev_ind] = 0;
 
+	mutex_unlock(&usf->mutex);
+	mutex_destroy(&usf->mutex);
 	kfree(usf);
 	pr_debug("%s: release exit\n", __func__);
 	return 0;

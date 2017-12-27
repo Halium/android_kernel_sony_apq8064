@@ -1,4 +1,4 @@
-/* Copyright (c) 2008-2013,2016, The Linux Foundation. All rights reserved.
+/* Copyright (c) 2008-2017, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -186,10 +186,11 @@ kgsl_mem_entry_create(void)
 {
 	struct kgsl_mem_entry *entry = kzalloc(sizeof(*entry), GFP_KERNEL);
 
-	if (!entry)
-		KGSL_CORE_ERR("kzalloc(%d) failed\n", sizeof(*entry));
-	else
+	if (entry) {
 		kref_init(&entry->refcount);
+		/* put this ref in the caller functions after init */
+		kref_get(&entry->refcount);
+	}
 
 	return entry;
 }
@@ -456,8 +457,8 @@ int kgsl_context_init(struct kgsl_device_private *dev_priv,
 		}
 
 		write_lock(&device->context_lock);
-		ret = idr_get_new_above(&device->context_idr, context, 1, &id);
-		context->id = id;
+		/* Allocate the slot but don't put a pointer in it yet */
+		ret = idr_get_new_above(&device->context_idr, NULL, 1, &id);
 		write_unlock(&device->context_lock);
 
 		if (ret != -EAGAIN)
@@ -469,12 +470,14 @@ int kgsl_context_init(struct kgsl_device_private *dev_priv,
 
 	/* MAX - 1, there is one memdesc in memstore for device info */
 	if (id >= KGSL_MEMSTORE_MAX) {
-		KGSL_DRV_INFO(device, "cannot have more than %d "
+		KGSL_DRV_INFO(device, "cannot have more than %zu "
 				"ctxts due to memstore limitation\n",
 				KGSL_MEMSTORE_MAX);
 		ret = -ENOSPC;
 		goto fail_free_id;
 	}
+
+	context->id = id;
 
 	kref_init(&context->refcount);
 	/*
@@ -895,11 +898,8 @@ kgsl_find_process_private(struct kgsl_device_private *cur_dev_priv)
 
 	/* no existing process private found for this dev_priv, create one */
 	private = kzalloc(sizeof(struct kgsl_process_private), GFP_KERNEL);
-	if (private == NULL) {
-		KGSL_DRV_ERR(cur_dev_priv->device, "kzalloc(%d) failed\n",
-			sizeof(struct kgsl_process_private));
+	if (private == NULL)
 		goto done;
-	}
 
 	kref_init(&private->refcount);
 
@@ -977,8 +977,6 @@ int kgsl_close_device(struct kgsl_device *device)
 		/* Fail if the wait times out */
 		BUG_ON(atomic_read(&device->active_cnt) > 0);
 
-		/* Force power on to do the stop */
-		kgsl_pwrctrl_enable(device);
 		result = device->ftbl->stop(device);
 		kgsl_pwrctrl_set_state(device, KGSL_STATE_INIT);
 	}
@@ -1130,8 +1128,6 @@ static int kgsl_open(struct inode *inodep, struct file *filep)
 
 	dev_priv = kzalloc(sizeof(struct kgsl_device_private), GFP_KERNEL);
 	if (dev_priv == NULL) {
-		KGSL_DRV_ERR(device, "kzalloc failed(%d)\n",
-			sizeof(struct kgsl_device_private));
 		result = -ENOMEM;
 		goto err_pmruntime;
 	}
@@ -2330,7 +2326,13 @@ static long kgsl_ioctl_drawctxt_create(struct kgsl_device_private *dev_priv,
 		goto done;
 	}
 	trace_kgsl_context_create(dev_priv->device, context, param->flags);
+
+	/* Commit the pointer to the context in context_idr */
+	write_lock(&device->context_lock);
+	idr_replace(&device->context_idr, context, context->id);
 	param->drawctxt_id = context->id;
+	write_unlock(&device->context_lock);
+
 done:
 	return result;
 }
@@ -2632,7 +2634,7 @@ static int kgsl_setup_useraddr(struct kgsl_mem_entry *entry,
 	size = ALIGN(size, PAGE_SIZE);
 
 	if (_check_region(offset & PAGE_MASK, size, len)) {
-		KGSL_CORE_ERR("Offset (%ld) + size (%d) is larger"
+		KGSL_CORE_ERR("Offset (%ld) + size (%zu) is larger"
 			      "than region length %d\n",
 			      offset & PAGE_MASK, size, len);
 		return -EINVAL;
@@ -2913,6 +2915,9 @@ static long kgsl_ioctl_map_user_mem(struct kgsl_device_private *dev_priv,
 	trace_kgsl_mem_map(entry, param->fd);
 
 	kgsl_mem_entry_commit_process(private, entry);
+
+	/* put the extra refcount for kgsl_mem_entry_create() */
+	kgsl_mem_entry_put(entry);
 	return result;
 
 error_attach:
@@ -3202,6 +3207,9 @@ kgsl_ioctl_gpumem_alloc(struct kgsl_device_private *dev_priv,
 	param->flags = entry->memdesc.flags;
 
 	kgsl_mem_entry_commit_process(private, entry);
+
+	/* put the extra refcount for kgsl_mem_entry_create() */
+	kgsl_mem_entry_put(entry);
 	return result;
 err:
 	kgsl_sharedmem_free(&entry->memdesc);
@@ -3240,6 +3248,9 @@ kgsl_ioctl_gpumem_alloc_id(struct kgsl_device_private *dev_priv,
 	param->gpuaddr = entry->memdesc.gpuaddr;
 
 	kgsl_mem_entry_commit_process(private, entry);
+
+	/* put the extra refcount for kgsl_mem_entry_create() */
+	kgsl_mem_entry_put(entry);
 	return result;
 err:
 	if (entry)

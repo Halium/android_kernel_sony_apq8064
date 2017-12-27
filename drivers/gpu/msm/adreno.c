@@ -1325,6 +1325,7 @@ done:
 static int adreno_of_get_iommu(struct device_node *parent,
 	struct kgsl_device_platform_data *pdata)
 {
+	int result = -EINVAL;
 	struct device_node *node, *child;
 	struct kgsl_device_iommu_data *data = NULL;
 	struct kgsl_iommu_ctx *ctxs = NULL;
@@ -1337,7 +1338,7 @@ static int adreno_of_get_iommu(struct device_node *parent,
 
 	data = kzalloc(sizeof(*data), GFP_KERNEL);
 	if (data == NULL) {
-		KGSL_CORE_ERR("kzalloc(%d) failed\n", sizeof(*data));
+		result = -ENOMEM;
 		goto err;
 	}
 
@@ -1358,8 +1359,7 @@ static int adreno_of_get_iommu(struct device_node *parent,
 		GFP_KERNEL);
 
 	if (ctxs == NULL) {
-		KGSL_CORE_ERR("kzalloc(%d) failed\n",
-			data->iommu_ctx_count * sizeof(struct kgsl_iommu_ctx));
+		result = -ENOMEM;
 		goto err;
 	}
 
@@ -1398,7 +1398,7 @@ err:
 	kfree(ctxs);
 	kfree(data);
 
-	return -EINVAL;
+	return result;
 }
 
 static int adreno_of_get_pdata(struct platform_device *pdev)
@@ -1423,7 +1423,6 @@ static int adreno_of_get_pdata(struct platform_device *pdev)
 
 	pdata = kzalloc(sizeof(*pdata), GFP_KERNEL);
 	if (pdata == NULL) {
-		KGSL_CORE_ERR("kzalloc(%d) failed\n", sizeof(*pdata));
 		ret = -ENOMEM;
 		goto err;
 	}
@@ -1439,7 +1438,7 @@ static int adreno_of_get_pdata(struct platform_device *pdev)
 
 	if (adreno_of_read_property(pdev->dev.of_node, "qcom,idle-timeout",
 		&pdata->idle_timeout))
-		pdata->idle_timeout = HZ/12;
+		pdata->idle_timeout = 80;
 
 	pdata->strtstp_sleepwake = of_property_read_bool(pdev->dev.of_node,
 						"qcom,strtstp-sleepwake");
@@ -1761,13 +1760,11 @@ static int adreno_start(struct kgsl_device *device)
 	kgsl_pwrctrl_irq(device, KGSL_PWRFLAGS_ON);
 	device->ftbl->irqctrl(device, 1);
 
+	adreno_perfcounter_start(adreno_dev);
+
 	status = adreno_ringbuffer_cold_start(&adreno_dev->ringbuffer);
 	if (status)
 		goto error_irq_off;
-
-	status = adreno_perfcounter_start(adreno_dev);
-	if (status)
-		goto error_rb_stop;
 
 	/* Start the dispatcher */
 	adreno_dispatcher_start(device);
@@ -1778,8 +1775,6 @@ static int adreno_start(struct kgsl_device *device)
 
 	return 0;
 
-error_rb_stop:
-	adreno_ringbuffer_stop(&adreno_dev->ringbuffer);
 error_irq_off:
 	kgsl_pwrctrl_irq(device, KGSL_PWRFLAGS_OFF);
 
@@ -1794,25 +1789,52 @@ error_clk_off:
 	return status;
 }
 
+/**
+ * adreno_vbif_clear_pending_transactions() - Clear transactions in VBIF pipe
+ * @device: Pointer to the device whose VBIF pipe is to be cleared
+ */
+static void adreno_vbif_clear_pending_transactions(struct kgsl_device *device)
+{
+	struct adreno_device *adreno_dev = ADRENO_DEVICE(device);
+	unsigned int mask = A3XX_VBIF_XIN_HALT_CTRL0_MASK;
+	unsigned int val;
+	unsigned long wait_for_vbif;
+
+	adreno_writereg(adreno_dev, ADRENO_REG_VBIF_XIN_HALT_CTRL0, mask);
+	/* wait for the transactions to clear */
+	wait_for_vbif = jiffies + msecs_to_jiffies(100);
+	while (1) {
+		adreno_readreg(adreno_dev,
+			ADRENO_REG_VBIF_XIN_HALT_CTRL1, &val);
+		if ((val & mask) == mask)
+			break;
+		if (time_after(jiffies, wait_for_vbif))
+			break;
+	}
+	adreno_writereg(adreno_dev, ADRENO_REG_VBIF_XIN_HALT_CTRL0, 0);
+}
+
+
 static int adreno_stop(struct kgsl_device *device)
 {
 	struct adreno_device *adreno_dev = ADRENO_DEVICE(device);
 
-	if (adreno_dev->drawctxt_active)
-		kgsl_context_put(&adreno_dev->drawctxt_active->base);
+	if (!test_bit(ADRENO_DEVICE_STARTED, &adreno_dev->priv))
+		return 0;
+
+	kgsl_pwrctrl_enable(device);
 
 	adreno_dev->drawctxt_active = NULL;
 
 	adreno_dispatcher_stop(adreno_dev);
-	adreno_ringbuffer_stop(&adreno_dev->ringbuffer);
-
-	kgsl_mmu_stop(&device->mmu);
 
 	device->ftbl->irqctrl(device, 0);
 	kgsl_pwrctrl_irq(device, KGSL_PWRFLAGS_OFF);
 	del_timer_sync(&device->idle_timer);
 
 	adreno_ocmem_gmem_free(adreno_dev);
+
+	kgsl_mmu_stop(&device->mmu);
 
 	/* Power down the device */
 	kgsl_pwrctrl_disable(device);
@@ -1835,15 +1857,13 @@ static int adreno_stop(struct kgsl_device *device)
 int adreno_reset(struct kgsl_device *device)
 {
 	int ret = -EINVAL;
-	struct kgsl_mmu *mmu = &device->mmu;
 	int i = 0;
 
-	/* Try soft reset first, for non mmu fault case only */
-	if (!atomic_read(&mmu->fault)) {
-		ret = adreno_soft_reset(device);
-		if (ret)
-			KGSL_DEV_ERR_ONCE(device, "Device soft reset failed\n");
-	}
+	/* clear pending vbif transactions before reset */
+	adreno_vbif_clear_pending_transactions(device);
+
+	/* Try soft reset first */
+	ret = adreno_soft_reset(device);
 	if (ret) {
 		/* If soft reset failed/skipped, then pull the power */
 		adreno_stop(device);
@@ -2404,13 +2424,12 @@ int adreno_soft_reset(struct kgsl_device *device)
 		return -EINVAL;
 	}
 
+	clear_bit(ADRENO_DEVICE_STARTED, &adreno_dev->priv);
+
 	if (adreno_dev->drawctxt_active)
 		kgsl_context_put(&adreno_dev->drawctxt_active->base);
 
 	adreno_dev->drawctxt_active = NULL;
-
-	/* Stop the ringbuffer */
-	adreno_ringbuffer_stop(&adreno_dev->ringbuffer);
 
 	if (kgsl_pwrctrl_isenabled(device))
 		device->ftbl->irqctrl(device, 0);
@@ -2447,8 +2466,11 @@ int adreno_soft_reset(struct kgsl_device *device)
 
 	if (ret)
 		return ret;
+	else {
+		device->reset_counter++;
+		set_bit(ADRENO_DEVICE_STARTED, &adreno_dev->priv);
+	}
 
-	device->reset_counter++;
 
 	return 0;
 }
@@ -2907,12 +2929,15 @@ static void adreno_power_stats(struct kgsl_device *device,
 	unsigned int cycles = 0;
 
 	/*
-	 * Get the busy cycles counted since the counter was last reset.
 	 * If we're not currently active, there shouldn't have been
 	 * any cycles since the last time this function was called.
 	 */
-	if (device->state == KGSL_STATE_ACTIVE)
-		cycles = adreno_dev->gpudev->busy_cycles(adreno_dev);
+
+	if (device->state != KGSL_STATE_ACTIVE)
+		return;
+
+	/* Get the busy cycles counted since the counter was last reset */
+	adreno_dev->gpudev->busy_cycles(adreno_dev);
 
 	/*
 	 * In order to calculate idle you have to have run the algorithm

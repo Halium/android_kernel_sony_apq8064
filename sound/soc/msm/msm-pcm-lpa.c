@@ -1,4 +1,4 @@
-/* Copyright (c) 2011-2013, The Linux Foundation. All rights reserved.
+/* Copyright (c) 2011-2013, 2017, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -26,7 +26,7 @@
 #include <sound/control.h>
 #include <asm/dma.h>
 #include <linux/dma-mapping.h>
-#include <linux/android_pmem.h>
+
 #include <sound/compress_params.h>
 #include <sound/compress_offload.h>
 #include <sound/compress_driver.h>
@@ -506,6 +506,7 @@ static int msm_pcm_playback_close(struct snd_pcm_substream *substream)
 	q6asm_audio_client_free(prtd->audio_client);
 	prtd->meta_data_mode = false;
 	kfree(prtd);
+	runtime->private_data = NULL;
 
 	return 0;
 }
